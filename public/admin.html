@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Kiro 凭证管理</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f5; padding: 2rem; color: #333; }
+    .container { max-width: 1000px; margin: 0 auto; }
+    h1 { margin-bottom: 1.5rem; }
+    h3 { margin-bottom: 1rem; font-size: 1.05rem; }
+    .card { background: #fff; border-radius: 8px; padding: 1.5rem; margin-bottom: 1.5rem; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
+    label { display: block; margin-bottom: 0.4rem; font-weight: 500; color: #555; font-size: 0.9rem; }
+    input[type="text"], input[type="password"], input[type="file"] { width: 100%; padding: 0.6rem; border: 1px solid #ddd; border-radius: 4px; font-size: 0.95rem; }
+    input[type="file"] { padding: 0.45rem; background: #fafafa; }
+    button { background: #4f46e5; color: #fff; border: none; padding: 0.6rem 1.2rem; border-radius: 4px; cursor: pointer; font-size: 0.9rem; }
+    button:hover { background: #4338ca; }
+    button:disabled { background: #9ca3af; cursor: not-allowed; }
+    button.secondary { background: #6b7280; }
+    button.secondary:hover { background: #4b5563; }
+    button.danger { background: #dc2626; padding: 0.3rem 0.6rem; font-size: 0.8rem; }
+    button.danger:hover { background: #b91c1c; }
+    .row { display: flex; gap: 0.6rem; flex-wrap: wrap; align-items: center; }
+    .result { margin-top: 1rem; padding: 0.9rem; background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 4px; word-break: break-all; font-size: 0.9rem; }
+    .result.error { background: #fef2f2; border-color: #fecaca; color: #991b1b; }
+    .result strong { font-family: ui-monospace, Menlo, Consolas, monospace; }
+    table { width: 100%; border-collapse: collapse; margin-top: 1rem; font-size: 0.88rem; }
+    th, td { padding: 0.55rem 0.6rem; text-align: left; border-bottom: 1px solid #eee; }
+    th { background: #f9fafb; font-weight: 600; color: #555; }
+    tr.used td { color: #9ca3af; }
+    .status-used { color: #ef4444; font-weight: 500; }
+    .status-unused { color: #16a34a; font-weight: 500; }
+    .toolbar { display: flex; justify-content: space-between; align-items: center; margin-top: 0.5rem; gap: 0.6rem; flex-wrap: wrap; }
+    .selection-info { font-size: 0.88rem; color: #555; }
+    .key-cell { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.78rem; color: #555; }
+    .copy-btn { background: #6b7280; padding: 0.25rem 0.55rem; font-size: 0.75rem; margin-left: 0.4rem; }
+    .copy-btn:hover { background: #4b5563; }
+    .empty { padding: 1rem; color: #888; text-align: center; }
+    .checkbox-cell { width: 32px; text-align: center; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1.5rem;">
+      <h1 style="margin:0;">Kiro 凭证管理后台</h1>
+      <button class="secondary" onclick="logout()">退出登录</button>
+    </div>
+
+    <div class="card">
+      <h3>上传账号 JSON 文件</h3>
+      <div class="row">
+        <input type="file" id="fileInput" accept="application/json,.json" style="flex:1; min-width: 240px;">
+        <button onclick="uploadFile()">上传并解析</button>
+      </div>
+      <div id="uploadResult"></div>
+    </div>
+
+    <div class="card">
+      <h3>账号列表</h3>
+      <div class="row">
+        <button onclick="loadAccounts()">刷新</button>
+        <button class="secondary" onclick="toggleSelectAll()">全选 / 反选未使用</button>
+      </div>
+      <div id="accountsContainer"></div>
+      <div class="toolbar">
+        <div class="selection-info" id="selectionInfo">已选 0 个</div>
+        <button id="genKeyBtn" onclick="generateKey()" disabled>生成下载密钥</button>
+      </div>
+      <div id="genKeyResult"></div>
+    </div>
+
+    <div class="card">
+      <h3>已生成密钥</h3>
+      <button onclick="loadKeys()">刷新</button>
+      <div id="keysContainer"></div>
+    </div>
+  </div>
+
+  <script>
+    const ADMIN_KEY_STORAGE = 'kiro_admin_key';
+    const accountsState = { rows: [] };
+
+    function getKey() { return localStorage.getItem(ADMIN_KEY_STORAGE) || ''; }
+
+    function logout() {
+      localStorage.removeItem(ADMIN_KEY_STORAGE);
+      location.replace('/login.html');
+    }
+
+    function requireLogin() {
+      if (!getKey()) { location.replace('/login.html'); return false; }
+      return true;
+    }
+
+    function handleAuthFailure(res) {
+      if (res.status === 401) {
+        localStorage.removeItem(ADMIN_KEY_STORAGE);
+        location.replace('/login.html');
+        return true;
+      }
+      return false;
+    }
+
+    function authHeaders(extra = {}) {
+      return { 'x-admin-key': getKey(), ...extra };
+    }
+
+    function showResult(elId, msg, isError = false) {
+      const el = document.getElementById(elId);
+      el.className = isError ? 'result error' : 'result';
+      el.innerHTML = msg;
+    }
+
+    async function uploadFile() {
+      const file = document.getElementById('fileInput').files[0];
+      if (!file) return alert('请选择文件');
+      const form = new FormData();
+      form.append('file', file);
+      try {
+        const res = await fetch('/api/admin/upload', {
+          method: 'POST',
+          headers: authHeaders(),
+          body: form
+        });
+        if (handleAuthFailure(res)) return;
+        const data = await res.json();
+        if (res.ok) {
+          showResult('uploadResult', `已导入 <strong>${data.inserted}</strong> 个账号${data.skipped ? `, 跳过 ${data.skipped} 个无效项` : ''}`);
+          loadAccounts();
+        } else {
+          showResult('uploadResult', data.error || '上传失败', true);
+        }
+      } catch (e) {
+        showResult('uploadResult', '请求失败', true);
+      }
+    }
+
+    async function loadAccounts() {
+      try {
+        const res = await fetch('/api/admin/accounts', { headers: authHeaders() });
+        if (handleAuthFailure(res)) return;
+        if (!res.ok) {
+          document.getElementById('accountsContainer').innerHTML = '<div class="empty">加载失败</div>';
+          return;
+        }
+        accountsState.rows = await res.json();
+        renderAccounts();
+      } catch (e) {
+        document.getElementById('accountsContainer').innerHTML = '<div class="empty">请求失败</div>';
+      }
+    }
+
+    function renderAccounts() {
+      const rows = accountsState.rows;
+      if (!rows.length) {
+        document.getElementById('accountsContainer').innerHTML = '<div class="empty">暂无账号, 请先上传 JSON 文件</div>';
+        updateSelection();
+        return;
+      }
+      let html = '<table><thead><tr>'
+        + '<th class="checkbox-cell"></th>'
+        + '<th>邮箱</th><th>区域</th><th>套餐</th><th>Provider</th>'
+        + '<th>状态</th><th>导入时间</th><th></th>'
+        + '</tr></thead><tbody>';
+      for (const r of rows) {
+        const usedCls = r.used ? 'used' : '';
+        const disabled = r.used ? 'disabled' : '';
+        html += `<tr class="${usedCls}">
+          <td class="checkbox-cell"><input type="checkbox" class="acct-cb" data-id="${r.id}" ${disabled} onchange="updateSelection()"></td>
+          <td>${escapeHtml(r.email || '-')}</td>
+          <td>${escapeHtml(r.region || '-')}</td>
+          <td>${escapeHtml(r.subscription || '-')}</td>
+          <td>${escapeHtml(r.provider || '-')}</td>
+          <td class="${r.used ? 'status-used' : 'status-unused'}">${r.used ? '已使用' : '未使用'}</td>
+          <td>${escapeHtml(r.created_at)}</td>
+          <td><button class="danger" onclick="deleteAccount(${r.id})">删除</button></td>
+        </tr>`;
+      }
+      html += '</tbody></table>';
+      document.getElementById('accountsContainer').innerHTML = html;
+      updateSelection();
+    }
+
+    function getSelectedIds() {
+      return Array.from(document.querySelectorAll('.acct-cb:checked'))
+        .map(cb => Number(cb.dataset.id));
+    }
+
+    function updateSelection() {
+      const ids = getSelectedIds();
+      document.getElementById('selectionInfo').textContent = `已选 ${ids.length} 个`;
+      document.getElementById('genKeyBtn').disabled = ids.length === 0;
+    }
+
+    function toggleSelectAll() {
+      const cbs = Array.from(document.querySelectorAll('.acct-cb:not(:disabled)'));
+      const allSelected = cbs.length > 0 && cbs.every(cb => cb.checked);
+      cbs.forEach(cb => { cb.checked = !allSelected; });
+      updateSelection();
+    }
+
+    async function deleteAccount(id) {
+      if (!confirm('确认删除该账号?')) return;
+      try {
+        const res = await fetch(`/api/admin/accounts/${id}`, {
+          method: 'DELETE',
+          headers: authHeaders()
+        });
+        if (handleAuthFailure(res)) return;
+        if (res.ok) loadAccounts();
+        else {
+          const data = await res.json().catch(() => ({}));
+          alert(data.error || '删除失败');
+        }
+      } catch (e) {
+        alert('请求失败');
+      }
+    }
+
+    async function generateKey() {
+      const ids = getSelectedIds();
+      if (!ids.length) return;
+      try {
+        const res = await fetch('/api/admin/generate-key', {
+          method: 'POST',
+          headers: authHeaders({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify({ accountIds: ids })
+        });
+        if (handleAuthFailure(res)) return;
+        const data = await res.json();
+        if (res.ok) {
+          showResult('genKeyResult',
+            `下载密钥 (含 ${data.count} 个账号): <strong>${data.key}</strong>`
+            + ` <button class="copy-btn" onclick="copyText('${data.key}')">复制</button>`
+          );
+          loadKeys();
+          loadAccounts();
+        } else {
+          showResult('genKeyResult', data.error || '生成失败', true);
+        }
+      } catch (e) {
+        showResult('genKeyResult', '请求失败', true);
+      }
+    }
+
+    async function loadKeys() {
+      try {
+        const res = await fetch('/api/admin/keys', { headers: authHeaders() });
+        if (handleAuthFailure(res)) return;
+        if (!res.ok) {
+          document.getElementById('keysContainer').innerHTML = '<div class="empty">加载失败</div>';
+          return;
+        }
+        const rows = await res.json();
+        if (!rows.length) {
+          document.getElementById('keysContainer').innerHTML = '<div class="empty">暂无密钥</div>';
+          return;
+        }
+        let html = '<table><thead><tr><th>密钥</th><th>账号数</th><th>状态</th><th>创建时间</th><th></th></tr></thead><tbody>';
+        for (const r of rows) {
+          html += `<tr>
+            <td class="key-cell">${escapeHtml(r.download_key)}</td>
+            <td>${r.account_count}</td>
+            <td class="${r.used ? 'status-used' : 'status-unused'}">${r.used ? '已使用' : '未使用'}</td>
+            <td>${escapeHtml(r.created_at)}</td>
+            <td><button class="copy-btn" onclick="copyText('${r.download_key}')">复制</button></td>
+          </tr>`;
+        }
+        html += '</tbody></table>';
+        document.getElementById('keysContainer').innerHTML = html;
+      } catch (e) {
+        document.getElementById('keysContainer').innerHTML = '<div class="empty">请求失败</div>';
+      }
+    }
+
+    function copyText(text) {
+      navigator.clipboard.writeText(text).then(() => {
+        // no-op
+      });
+    }
+
+    function escapeHtml(s) {
+      if (s == null) return '';
+      return String(s).replace(/[&<>"']/g, c => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+      }[c]));
+    }
+
+    if (requireLogin()) {
+      loadAccounts();
+      loadKeys();
+    }
+  </script>
+</body>
+</html>

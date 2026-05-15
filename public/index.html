@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Kiro 凭证下载</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, sans-serif; background: #f5f5f5; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+    .card { background: #fff; border-radius: 8px; padding: 2rem; box-shadow: 0 2px 12px rgba(0,0,0,0.1); width: 100%; max-width: 400px; }
+    h1 { font-size: 1.4rem; margin-bottom: 1.5rem; color: #333; text-align: center; }
+    label { display: block; margin-bottom: 0.5rem; font-weight: 500; color: #555; }
+    input { width: 100%; padding: 0.7rem; border: 1px solid #ddd; border-radius: 4px; margin-bottom: 1rem; font-size: 1rem; }
+    button { width: 100%; background: #4f46e5; color: #fff; border: none; padding: 0.8rem; border-radius: 4px; cursor: pointer; font-size: 1rem; }
+    button:hover { background: #4338ca; }
+    .msg { margin-top: 1rem; padding: 0.8rem; border-radius: 4px; text-align: center; }
+    .msg.error { background: #fef2f2; color: #dc2626; border: 1px solid #fecaca; }
+    .msg.success { background: #f0fdf4; color: #16a34a; border: 1px solid #bbf7d0; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Kiro 凭证下载</h1>
+    <label>输入下载密钥</label>
+    <input type="text" id="keyInput" placeholder="请输入密钥">
+    <button onclick="download()">下载凭证</button>
+    <div id="msg"></div>
+  </div>
+  <script>
+    async function download() {
+      const key = document.getElementById('keyInput').value.trim();
+      if (!key) return;
+      const msg = document.getElementById('msg');
+      try {
+        const res = await fetch(`/api/download/${key}`);
+        if (!res.ok) {
+          const data = await res.json();
+          msg.className = 'msg error';
+          msg.textContent = data.error || '下载失败';
+          return;
+        }
+        const blob = await res.blob();
+        const filename = res.headers.get('content-disposition')?.match(/filename="?(.+?)"?$/)?.[1] || 'certificate';
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = decodeURIComponent(filename);
+        a.click();
+        msg.className = 'msg success';
+        msg.textContent = '下载成功';
+      } catch (e) {
+        msg.className = 'msg error';
+        msg.textContent = '请求失败';
+      }
+    }
+    document.getElementById('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') download(); });
+  </script>
+</body>
+</html>

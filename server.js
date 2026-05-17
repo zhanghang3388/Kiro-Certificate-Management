@@ -15,6 +15,26 @@ const KIRO_AUTH_ENDPOINT = 'https://prod.us-east-1.auth.desktop.kiro.dev';
 const KIRO_VERSION = '0.6.18';
 const KIRO_USER_AGENT = `aws-sdk-js/1.0.18 ua/2.1 os/windows lang/js md/nodejs#20.16.0 api/codewhispererstreaming#1.0.18 m/E KiroIDE-${KIRO_VERSION}`;
 
+// Kiro 订阅 API 配置
+const KIRO_SUBSCRIPTION_VERSION = '0.12.155';
+const KIRO_SUB_USER_AGENT = `aws-sdk-js/1.0.0 ua/2.1 os/win32#10.0.19043 lang/js md/nodejs#22.22.0 api/codewhispererruntime#1.0.0 m/N,E KiroIDE-${KIRO_SUBSCRIPTION_VERSION}`;
+const KIRO_SUB_AMZ_USER_AGENT = `aws-sdk-js/1.0.0 KiroIDE-${KIRO_SUBSCRIPTION_VERSION}`;
+const KIRO_BUILDER_ID_PROFILE_ARN = 'arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX';
+const KIRO_SOCIAL_PROFILE_ARN = 'arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK';
+
+function getQEndpoint(region) {
+  if (region && region.startsWith('eu-')) return 'https://q.eu-central-1.amazonaws.com';
+  return 'https://q.us-east-1.amazonaws.com';
+}
+
+function resolveProfileArn(raw) {
+  if (raw.profileArn) return raw.profileArn;
+  if (raw.provider === 'Github' || raw.provider === 'Google' || raw.authMethod === 'social') {
+    return KIRO_SOCIAL_PROFILE_ARN;
+  }
+  return KIRO_BUILDER_ID_PROFILE_ARN;
+}
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024 }
@@ -197,7 +217,117 @@ async function keepAliveTick() {
   }
 }
 
-// ========== 管理 API ==========
+// ========== Kiro 订阅 API ==========
+
+function buildSubHeaders(accessToken) {
+  return {
+    'Authorization': `Bearer ${accessToken}`,
+    'content-type': 'application/json',
+    'user-agent': KIRO_SUB_USER_AGENT,
+    'x-amz-user-agent': KIRO_SUB_AMZ_USER_AGENT,
+    'amz-sdk-invocation-id': uuidv4(),
+    'amz-sdk-request': 'attempt=1; max=1'
+  };
+}
+
+// 确保账号有可用的 access token，必要时先刷新
+async function ensureFreshAccessToken(accountRow) {
+  const raw = JSON.parse(accountRow.raw_json);
+  const expiresSoon = !accountRow.expires_at || accountRow.expires_at - Date.now() < 60 * 1000;
+  if (accountRow.access_token && !expiresSoon) {
+    return { ok: true, accessToken: accountRow.access_token, raw };
+  }
+  const result = await refreshTokenForAccount(accountRow);
+  persistRefresh(accountRow.id, raw, result);
+  if (!result.success) return { ok: false, error: result.error };
+  return { ok: true, accessToken: result.accessToken, raw };
+}
+
+async function listAvailableSubscriptions(accountRow) {
+  const fresh = await ensureFreshAccessToken(accountRow);
+  if (!fresh.ok) return { success: false, error: fresh.error };
+
+  const url = `${getQEndpoint(fresh.raw.region)}/listAvailableSubscriptions`;
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: buildSubHeaders(fresh.accessToken),
+      body: JSON.stringify({ profileArn: resolveProfileArn(fresh.raw) })
+    });
+    const text = await response.text();
+    if (!response.ok) {
+      return { success: false, error: `HTTP ${response.status}: ${text.slice(0, 200)}` };
+    }
+    const data = JSON.parse(text);
+    return { success: true, plans: data.subscriptionPlans || [], disclaimer: data.disclaimer || [] };
+  } catch (err) {
+    return { success: false, error: err.message || 'Unknown error' };
+  }
+}
+
+async function createSubscriptionToken(accountRow, subscriptionType) {
+  const fresh = await ensureFreshAccessToken(accountRow);
+  if (!fresh.ok) return { success: false, error: fresh.error };
+
+  const url = `${getQEndpoint(fresh.raw.region)}/CreateSubscriptionToken`;
+  const payload = {
+    clientToken: uuidv4(),
+    profileArn: resolveProfileArn(fresh.raw),
+    provider: 'STRIPE'
+  };
+  if (subscriptionType) payload.subscriptionType = subscriptionType;
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: buildSubHeaders(fresh.accessToken),
+      body: JSON.stringify(payload)
+    });
+    const text = await response.text();
+    if (!response.ok) {
+      return { success: false, error: `HTTP ${response.status}: ${text.slice(0, 300)}` };
+    }
+    const data = JSON.parse(text);
+    return { success: true, url: data.encodedVerificationUrl, status: data.status, raw: data };
+  } catch (err) {
+    return { success: false, error: err.message || 'Unknown error' };
+  }
+}
+
+// ========== Settings (BitBrowser 配置) ==========
+
+const DEFAULT_BITBROWSER_API = 'http://127.0.0.1:54345';
+
+function getSettings() {
+  const rows = db.prepare('SELECT key, value FROM settings').all();
+  const map = Object.fromEntries(rows.map(r => [r.key, r.value]));
+  return {
+    bitbrowserEnabled: map.bitbrowser_enabled === '1',
+    bitbrowserApi: map.bitbrowser_api || DEFAULT_BITBROWSER_API,
+    bitbrowserGroupId: map.bitbrowser_group_id || ''
+  };
+}
+
+function saveSettings(patch) {
+  const upsert = db.prepare(`
+    INSERT INTO settings (key, value) VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+  `);
+  const tx = db.transaction(() => {
+    if ('bitbrowserEnabled' in patch) upsert.run('bitbrowser_enabled', patch.bitbrowserEnabled ? '1' : '0');
+    if ('bitbrowserApi' in patch) upsert.run('bitbrowser_api', String(patch.bitbrowserApi || ''));
+    if ('bitbrowserGroupId' in patch) upsert.run('bitbrowser_group_id', String(patch.bitbrowserGroupId || ''));
+  });
+  tx();
+}
+
+// ========== BitBrowser 配置说明 ==========
+// 比特指纹浏览器只在你本机监听 127.0.0.1, 因此服务部署到 VPS 后无法直接调用,
+// 真正的开窗动作由前端 JS 在你打开管理页的浏览器里直连本地比特 API 完成。
+// 这里只负责保存 / 读取地址等配置, 给前端 fetch 用。
+
+
+
 
 app.post('/api/admin/upload', adminAuth, upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: '未提供文件' });
@@ -255,10 +385,29 @@ app.post('/api/admin/upload', adminAuth, upload.single('file'), async (req, res)
 app.get('/api/admin/accounts', adminAuth, (req, res) => {
   const rows = db.prepare(`
     SELECT id, client_id, email, region, subscription, provider, used,
-           created_at, expires_at, last_status, last_error, last_checked_at
+           created_at, expires_at, last_status, last_error, last_checked_at,
+           bit_window_id, proxy_json
     FROM accounts
     ORDER BY id DESC
   `).all();
+  // 把 proxy_json 反序列化, 隐藏密码（仅返回是否设置过）
+  for (const r of rows) {
+    if (r.proxy_json) {
+      try {
+        const p = JSON.parse(r.proxy_json);
+        r.proxy = {
+          proxyType: p.proxyType || 'noproxy',
+          host: p.host || '',
+          port: p.port || '',
+          proxyUserName: p.proxyUserName || '',
+          hasPassword: !!p.proxyPassword
+        };
+      } catch { r.proxy = null; }
+    } else {
+      r.proxy = null;
+    }
+    delete r.proxy_json;
+  }
   res.json(rows);
 });
 
@@ -293,6 +442,128 @@ app.post('/api/admin/accounts/refresh-all', adminAuth, async (req, res) => {
     if (result.success) ok++; else fail++;
   }
   res.json({ total: rows.length, ok, fail });
+});
+
+// ===== 账号代理 / 比特窗口绑定 =====
+
+const ALLOWED_PROXY_TYPES = new Set(['noproxy', 'http', 'https', 'socks5', 'ssh']);
+
+app.put('/api/admin/accounts/:id/proxy', adminAuth, (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: '无效 ID' });
+  const row = db.prepare('SELECT id, proxy_json FROM accounts WHERE id = ?').get(id);
+  if (!row) return res.status(404).json({ error: '账号不存在' });
+
+  const body = req.body || {};
+  const proxyType = String(body.proxyType || 'noproxy').toLowerCase();
+  if (!ALLOWED_PROXY_TYPES.has(proxyType)) {
+    return res.status(400).json({ error: '无效的代理类型' });
+  }
+
+  if (proxyType === 'noproxy') {
+    db.prepare('UPDATE accounts SET proxy_json = NULL WHERE id = ?').run(id);
+    return res.json({ ok: true, proxy: null });
+  }
+
+  // 保留旧密码：当前端没传 proxyPassword 字段时不覆盖
+  let prev = {};
+  if (row.proxy_json) {
+    try { prev = JSON.parse(row.proxy_json) || {}; } catch {}
+  }
+
+  const proxy = {
+    proxyType,
+    host: String(body.host || '').trim(),
+    port: String(body.port || '').trim(),
+    proxyUserName: String(body.proxyUserName || '').trim(),
+    proxyPassword: typeof body.proxyPassword === 'string'
+      ? body.proxyPassword
+      : (prev.proxyPassword || '')
+  };
+
+  if (!proxy.host || !proxy.port) {
+    return res.status(400).json({ error: 'host 和 port 必填' });
+  }
+
+  db.prepare('UPDATE accounts SET proxy_json = ? WHERE id = ?').run(JSON.stringify(proxy), id);
+  res.json({
+    ok: true,
+    proxy: {
+      proxyType: proxy.proxyType,
+      host: proxy.host,
+      port: proxy.port,
+      proxyUserName: proxy.proxyUserName,
+      hasPassword: !!proxy.proxyPassword
+    }
+  });
+});
+
+// 拉取完整代理配置（包含密码），供前端调比特用
+app.get('/api/admin/accounts/:id/proxy-detail', adminAuth, (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: '无效 ID' });
+  const row = db.prepare('SELECT proxy_json FROM accounts WHERE id = ?').get(id);
+  if (!row) return res.status(404).json({ error: '账号不存在' });
+  if (!row.proxy_json) return res.json({ proxy: null });
+  try {
+    res.json({ proxy: JSON.parse(row.proxy_json) });
+  } catch {
+    res.json({ proxy: null });
+  }
+});
+
+app.put('/api/admin/accounts/:id/bit-window', adminAuth, (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: '无效 ID' });
+  const windowId = req.body?.windowId;
+  if (windowId !== null && typeof windowId !== 'string') {
+    return res.status(400).json({ error: 'windowId 必须是字符串或 null' });
+  }
+  const result = db.prepare('UPDATE accounts SET bit_window_id = ? WHERE id = ?').run(windowId || null, id);
+  if (!result.changes) return res.status(404).json({ error: '账号不存在' });
+  res.json({ ok: true });
+});
+
+// ===== 订阅 API =====
+app.get('/api/admin/accounts/:id/subscriptions', adminAuth, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: '无效 ID' });
+  const row = db.prepare('SELECT * FROM accounts WHERE id = ?').get(id);
+  if (!row) return res.status(404).json({ error: '账号不存在' });
+  const result = await listAvailableSubscriptions(row);
+  if (!result.success) return res.status(400).json({ error: result.error });
+  res.json({ plans: result.plans, disclaimer: result.disclaimer });
+});
+
+app.post('/api/admin/accounts/:id/subscription-url', adminAuth, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: '无效 ID' });
+  const row = db.prepare('SELECT * FROM accounts WHERE id = ?').get(id);
+  if (!row) return res.status(404).json({ error: '账号不存在' });
+
+  const subscriptionType = req.body?.subscriptionType;
+  const tokenResult = await createSubscriptionToken(row, subscriptionType);
+  if (!tokenResult.success) return res.status(400).json({ error: tokenResult.error });
+  if (!tokenResult.url) return res.status(400).json({ error: '响应中没有支付链接' });
+
+  // 比特浏览器开窗动作由前端浏览器直连本地 API 完成
+  res.json({ url: tokenResult.url });
+});
+
+// ===== 设置 API =====
+
+app.get('/api/admin/settings', adminAuth, (req, res) => {
+  res.json(getSettings());
+});
+
+app.post('/api/admin/settings', adminAuth, (req, res) => {
+  const body = req.body || {};
+  const patch = {};
+  if (typeof body.bitbrowserEnabled === 'boolean') patch.bitbrowserEnabled = body.bitbrowserEnabled;
+  if (typeof body.bitbrowserApi === 'string') patch.bitbrowserApi = body.bitbrowserApi.trim();
+  if (typeof body.bitbrowserGroupId === 'string') patch.bitbrowserGroupId = body.bitbrowserGroupId.trim();
+  saveSettings(patch);
+  res.json({ ok: true, settings: getSettings() });
 });
 
 app.post('/api/admin/generate-key', adminAuth, (req, res) => {

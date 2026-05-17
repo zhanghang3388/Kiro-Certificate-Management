@@ -33,6 +33,11 @@ db.exec(`
     FOREIGN KEY (download_key_id) REFERENCES download_keys(id) ON DELETE CASCADE,
     FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
   );
+
+  CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT
+  );
 `);
 
 // 兼容旧库：增量添加保活相关字段
@@ -49,5 +54,7 @@ addColumn('expires_at', 'expires_at INTEGER');
 addColumn('last_checked_at', 'last_checked_at TEXT');
 addColumn('last_status', `last_status TEXT DEFAULT 'unknown'`);
 addColumn('last_error', 'last_error TEXT');
+addColumn('bit_window_id', 'bit_window_id TEXT');
+addColumn('proxy_json', 'proxy_json TEXT');
 
 module.exports = db;

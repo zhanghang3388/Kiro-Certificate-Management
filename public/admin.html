@@ -119,9 +119,55 @@
     .acct-error { font-size: 0.72rem; color: #b91c1c; word-break: break-word; max-height: 36px; overflow: hidden; }
 
     .acct-actions {
-      display: flex; gap: 0.35rem; justify-content: flex-end;
+      display: flex; gap: 0.35rem; justify-content: flex-end; flex-wrap: wrap;
       border-top: 1px solid #f3f4f6; padding-top: 0.55rem;
     }
+
+    /* ===== Modal ===== */
+    .modal-mask {
+      position: fixed; inset: 0; background: rgba(15, 23, 42, .55);
+      display: flex; align-items: center; justify-content: center;
+      z-index: 100; padding: 1rem;
+    }
+    .modal {
+      background: #fff; border-radius: 12px; max-width: 720px; width: 100%;
+      max-height: 90vh; overflow: auto; box-shadow: 0 20px 60px rgba(0,0,0,.25);
+    }
+    .modal-head {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 1rem 1.25rem; border-bottom: 1px solid #f3f4f6;
+    }
+    .modal-head h3 { margin: 0; }
+    .modal-body { padding: 1.25rem; }
+    .modal-foot {
+      padding: .75rem 1.25rem; border-top: 1px solid #f3f4f6;
+      display: flex; justify-content: flex-end; gap: .5rem;
+    }
+    .modal-close {
+      background: transparent; color: #6b7280; padding: .25rem .5rem;
+    }
+    .modal-close:hover { background: #f3f4f6; color: #111827; }
+
+    .plans { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: .75rem; }
+    .plan {
+      border: 1.5px solid #e5e7eb; border-radius: 10px; padding: 1rem;
+      cursor: pointer; transition: border-color .15s, box-shadow .15s, transform .15s;
+      display: flex; flex-direction: column; gap: .35rem;
+    }
+    .plan:hover { border-color: #4f46e5; box-shadow: 0 4px 14px rgba(79,70,229,.15); }
+    .plan.loading { opacity: .6; cursor: wait; }
+    .plan-title { font-weight: 700; font-size: 1rem; color: #111827; }
+    .plan-price { font-size: 1.2rem; color: #4f46e5; font-weight: 700; }
+    .plan-features { font-size: .78rem; color: #6b7280; }
+    .plan-features li { margin-left: 1rem; }
+
+    .toggle { display: inline-flex; align-items: center; gap: .5rem; font-size: .9rem; color: #374151; }
+    .toggle input { width: 18px; height: 18px; }
+    .field { display: flex; flex-direction: column; gap: .35rem; margin-bottom: .8rem; }
+    .field label { margin: 0; }
+    .hint { font-size: .78rem; color: #6b7280; }
+    .ok-text { color: #15803d; font-size: .85rem; }
+    .err-text { color: #b91c1c; font-size: .85rem; }
   </style>
 </head>
 <body>
@@ -129,6 +175,33 @@
     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1.5rem;">
       <h1 style="margin:0;">Kiro 凭证管理后台</h1>
       <button class="secondary" onclick="logout()">退出登录</button>
+    </div>
+
+    <div class="card">
+      <h3>系统设置 · 比特指纹浏览器</h3>
+      <div class="hint" style="margin-bottom:.8rem; padding:.6rem; background:#fef9c3; border-radius:6px; color:#854d0e;">
+        <strong>注意：</strong>开窗动作由你打开本页的浏览器 JS 直接调用本机比特浏览器 API。
+        因此把服务部署到 VPS 后, 必须由<strong>你本机</strong>装好比特浏览器才会生效。
+        如果浏览器拦截 mixed-content 或 CORS, 请用 http 访问本管理页, 或在比特里关掉跨域限制。
+      </div>
+      <label class="toggle" style="margin-bottom: .8rem;">
+        <input type="checkbox" id="bitEnabled">
+        启用：开通订阅时自动调用本机比特浏览器开窗
+      </label>
+      <div class="field">
+        <label>本地 API 地址（仅你本机能访问）</label>
+        <input type="text" id="bitApi" placeholder="http://127.0.0.1:54345">
+        <div class="hint">默认 127.0.0.1:54345。装好客户端后在「系统设置」里能看到实际端口。</div>
+      </div>
+      <div class="field">
+        <label>分组 ID（可选）</label>
+        <input type="text" id="bitGroupId" placeholder="留空表示默认分组">
+      </div>
+      <div class="row">
+        <button onclick="saveBitSettings()">保存设置</button>
+        <button class="secondary" onclick="testBitBrowser()">测试连接</button>
+        <span id="bitStatus" class="hint"></span>
+      </div>
     </div>
 
     <div class="card">
@@ -161,6 +234,8 @@
       <div id="keysContainer"></div>
     </div>
   </div>
+
+  <div id="modalRoot"></div>
 
   <script>
     const ADMIN_KEY_STORAGE = 'kiro_admin_key';
@@ -300,8 +375,12 @@
             <span class="meta"><span class="label">过期:</span>${formatExpiry(r.expires_at)}</span>
           </div>
           ${r.last_checked_at ? `<div class="meta"><span class="label">最近检测:</span>${esc(r.last_checked_at)}</div>` : ''}
+          ${r.bit_window_id ? `<div class="meta"><span class="label">比特窗口:</span><span class="key-cell">${esc(String(r.bit_window_id).slice(0, 8))}…</span></div>` : ''}
+          ${r.proxy ? `<div class="meta"><span class="label">代理:</span>${esc(r.proxy.proxyType)} ${esc(r.proxy.host)}:${esc(r.proxy.port)}</div>` : ''}
           ${errorLine}
           <div class="acct-actions" onclick="event.stopPropagation()">
+            ${!r.used ? `<button class="ghost" onclick="openSubscribe(${r.id})">开通订阅</button>` : ''}
+            ${!r.used ? `<button class="ghost" onclick="editProxy(${r.id})">代理</button>` : ''}
             ${!r.used ? `<button class="ghost" onclick="refreshOne(${r.id})">立即保活</button>` : ''}
             <button class="ghost danger" onclick="deleteAccount(${r.id})">删除</button>
           </div>
@@ -453,7 +532,386 @@
       }[c]));
     }
 
+    // ===== 设置 =====
+    async function loadSettings() {
+      try {
+        const res = await fetch('/api/admin/settings', { headers: authHeaders() });
+        if (handleAuthFailure(res)) return;
+        const s = await res.json();
+        document.getElementById('bitEnabled').checked = !!s.bitbrowserEnabled;
+        document.getElementById('bitApi').value = s.bitbrowserApi || '';
+        document.getElementById('bitGroupId').value = s.bitbrowserGroupId || '';
+        bitState.enabled = !!s.bitbrowserEnabled;
+        bitState.api = s.bitbrowserApi || 'http://127.0.0.1:54345';
+        bitState.groupId = s.bitbrowserGroupId || '';
+      } catch (e) { /* ignore */ }
+    }
+
+    async function saveBitSettings() {
+      const body = {
+        bitbrowserEnabled: document.getElementById('bitEnabled').checked,
+        bitbrowserApi: document.getElementById('bitApi').value.trim(),
+        bitbrowserGroupId: document.getElementById('bitGroupId').value.trim()
+      };
+      const status = document.getElementById('bitStatus');
+      status.textContent = '保存中...';
+      status.className = 'hint';
+      try {
+        const res = await fetch('/api/admin/settings', {
+          method: 'POST',
+          headers: authHeaders({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify(body)
+        });
+        if (handleAuthFailure(res)) return;
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          status.textContent = data.error || '保存失败';
+          status.className = 'err-text';
+          return;
+        }
+        bitState.enabled = body.bitbrowserEnabled;
+        bitState.api = body.bitbrowserApi || 'http://127.0.0.1:54345';
+        bitState.groupId = body.bitbrowserGroupId;
+        status.textContent = '已保存';
+        status.className = 'ok-text';
+      } catch (e) {
+        status.textContent = '请求失败';
+        status.className = 'err-text';
+      }
+    }
+
+    // ===== 比特浏览器本地 API =====
+    // 在用户当前浏览器里直连 127.0.0.1, 服务部署到 VPS 后这个调用从你本机发出
+    const bitState = { api: '', enabled: false, groupId: '' };
+
+    async function bitFetch(pathname, body, timeoutMs = 8000) {
+      const apiBase = (bitState.api || 'http://127.0.0.1:54345').replace(/\/+$/, '');
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+      try {
+        const res = await fetch(`${apiBase}${pathname}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body || {}),
+          signal: ctrl.signal
+        });
+        const text = await res.text();
+        let parsed = {};
+        try { parsed = text ? JSON.parse(text) : {}; } catch {}
+        if (!res.ok) return { success: false, error: `HTTP ${res.status}: ${text.slice(0, 200)}` };
+        if (parsed.success === false) return { success: false, error: parsed.msg || '比特返回失败' };
+        return { success: true, data: parsed.data ?? parsed };
+      } catch (e) {
+        const msg = e.name === 'AbortError' ? '请求超时'
+          : (e.message || '网络错误，请检查比特浏览器是否运行');
+        return { success: false, error: msg };
+      } finally { clearTimeout(timer); }
+    }
+
+    async function bitOpenUrl(url, name) {
+      const update = await bitFetch('/browser/update', {
+        name: name || `Kiro 订阅 ${new Date().toLocaleString('zh-CN')}`,
+        remark: 'Kiro 凭证管理 - 自动创建',
+        url,
+        groupId: bitState.groupId || '',
+        proxyMethod: 2,
+        proxyType: 'noproxy',
+        browserFingerPrint: { coreVersion: '112' }
+      });
+      if (!update.success) return update;
+      const id = update.data?.id;
+      if (!id) return { success: false, error: '未返回窗口 id' };
+      const opened = await bitFetch('/browser/open', { id, queue: true }, 30000);
+      if (!opened.success) return { success: false, error: opened.error, windowId: id };
+      return { success: true, windowId: id };
+    }
+
+    // 复用窗口版本：传入账号信息和已有 windowId 时复用同一个比特窗口
+    async function bitOpenUrlForAccount(account, url, proxy) {
+      const proxyFields = (proxy && proxy.proxyType && proxy.proxyType !== 'noproxy') ? {
+        proxyMethod: 2,
+        proxyType: proxy.proxyType,
+        host: proxy.host || '',
+        port: String(proxy.port || ''),
+        proxyUserName: proxy.proxyUserName || '',
+        proxyPassword: proxy.proxyPassword || ''
+      } : { proxyMethod: 2, proxyType: 'noproxy' };
+
+      const payload = {
+        name: `Kiro · ${account.email || account.id}`,
+        remark: `Kiro 凭证 #${account.id}`,
+        url,
+        groupId: bitState.groupId || '',
+        ...proxyFields,
+        browserFingerPrint: { coreVersion: '112' }
+      };
+
+      // 复用：传 id 表示更新而非新建
+      if (account.bit_window_id) {
+        payload.id = account.bit_window_id;
+      }
+
+      const update = await bitFetch('/browser/update', payload);
+      if (!update.success) {
+        // 如果 id 失效（窗口被删了）, 去掉 id 重试一次新建
+        if (account.bit_window_id) {
+          delete payload.id;
+          const retry = await bitFetch('/browser/update', payload);
+          if (!retry.success) return retry;
+          update.data = retry.data;
+        } else {
+          return update;
+        }
+      }
+      const id = update.data?.id;
+      if (!id) return { success: false, error: '未返回窗口 id' };
+
+      const opened = await bitFetch('/browser/open', { id, queue: true }, 30000);
+      if (!opened.success) return { success: false, error: opened.error, windowId: id };
+      return { success: true, windowId: id, isNew: !account.bit_window_id || account.bit_window_id !== id };
+    }
+
+    async function testBitBrowser() {
+      bitState.api = document.getElementById('bitApi').value.trim() || 'http://127.0.0.1:54345';
+      const status = document.getElementById('bitStatus');
+      status.textContent = '测试中...';
+      status.className = 'hint';
+      const r = await bitFetch('/health', {}, 3000);
+      if (r.success) {
+        status.textContent = `连接成功: ${bitState.api}`;
+        status.className = 'ok-text';
+      } else {
+        status.textContent = r.error;
+        status.className = 'err-text';
+      }
+    }
+
+    // ===== 弹窗工具 =====
+    function showModal(html) {
+      const root = document.getElementById('modalRoot');
+      root.innerHTML = `<div class="modal-mask" onclick="if(event.target===this) closeModal()"><div class="modal">${html}</div></div>`;
+    }
+    function closeModal() { document.getElementById('modalRoot').innerHTML = ''; }
+
+    // ===== 订阅流程 =====
+    async function openSubscribe(accountId) {
+      showModal(`
+        <div class="modal-head">
+          <h3>开通订阅</h3>
+          <button class="modal-close" onclick="closeModal()">关闭</button>
+        </div>
+        <div class="modal-body" id="subBody">
+          <div class="hint">正在拉取可用套餐...</div>
+        </div>
+      `);
+      try {
+        const res = await fetch(`/api/admin/accounts/${accountId}/subscriptions`, { headers: authHeaders() });
+        if (handleAuthFailure(res)) return;
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          renderSubError(accountId, data.error || '获取订阅列表失败');
+          return;
+        }
+        renderPlans(accountId, data.plans || [], data.disclaimer || []);
+      } catch (e) {
+        renderSubError(accountId, '请求失败');
+      }
+    }
+
+    function renderSubError(accountId, msg) {
+      const body = document.getElementById('subBody');
+      if (!body) return;
+      body.innerHTML = `
+        <div class="err-text" style="margin-bottom:.8rem;">${esc(msg)}</div>
+        <div class="hint">如需直接获取管理链接, 可点击下方按钮:</div>
+        <div style="margin-top:.6rem;">
+          <button onclick="fetchSubUrl(${accountId}, null)">获取订阅管理链接</button>
+        </div>
+      `;
+    }
+
+    function renderPlans(accountId, plans, disclaimer) {
+      const body = document.getElementById('subBody');
+      if (!body) return;
+      if (!plans.length) {
+        body.innerHTML = `
+          <div class="hint" style="margin-bottom:.8rem;">该账号当前没有可用的升级套餐, 可直接获取订阅管理链接:</div>
+          <button onclick="fetchSubUrl(${accountId}, null)">获取订阅管理链接</button>
+        `;
+        return;
+      }
+      const cards = plans.map(p => {
+        const title = p.description?.title || p.name;
+        const price = p.pricing
+          ? `${p.pricing.currency || ''} ${(p.pricing.amount || 0).toFixed(2)}/${p.description?.billingInterval || ''}`
+          : '';
+        const features = (p.description?.features || []).slice(0, 5)
+          .map(f => `<li>${esc(f)}</li>`).join('');
+        return `
+          <div class="plan" id="plan_${esc(p.qSubscriptionType || p.name)}"
+               onclick="fetchSubUrl(${accountId}, '${esc(p.qSubscriptionType || p.name)}')">
+            <div class="plan-title">${esc(title)}</div>
+            <div class="plan-price">${esc(price)}</div>
+            ${p.description?.featureHeader ? `<div class="hint">${esc(p.description.featureHeader)}</div>` : ''}
+            <ul class="plan-features">${features}</ul>
+          </div>
+        `;
+      }).join('');
+      const disc = disclaimer.length
+        ? `<div class="hint" style="margin-top:.8rem;">${disclaimer.map(esc).join('<br>')}</div>` : '';
+      body.innerHTML = `
+        <div class="plans">${cards}</div>
+        ${disc}
+        <div id="subResult" style="margin-top:.8rem;"></div>
+      `;
+    }
+
+    async function fetchSubUrl(accountId, subscriptionType) {
+      const result = document.getElementById('subResult') || document.getElementById('subBody');
+      if (subscriptionType) {
+        const card = document.getElementById(`plan_${subscriptionType}`);
+        if (card) card.classList.add('loading');
+      }
+      result.innerHTML = '<div class="hint">正在获取支付链接...</div>';
+      try {
+        const res = await fetch(`/api/admin/accounts/${accountId}/subscription-url`, {
+          method: 'POST',
+          headers: authHeaders({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify({ subscriptionType })
+        });
+        if (handleAuthFailure(res)) return;
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          result.innerHTML = `<div class="err-text">${esc(data.error || '获取失败')}</div>`;
+          return;
+        }
+        const link = data.url;
+        await navigator.clipboard.writeText(link).catch(() => {});
+
+        let bitMsg = '';
+        if (bitState.enabled) {
+          result.innerHTML = `<div class="hint">支付链接已复制, 正在调用本机比特浏览器开窗...</div>`;
+          const account = accountsState.rows.find(r => r.id === accountId) || { id: accountId };
+
+          // 拉账号代理（含密码）
+          let proxy = null;
+          try {
+            const pr = await fetch(`/api/admin/accounts/${accountId}/proxy-detail`, { headers: authHeaders() });
+            if (pr.ok) proxy = (await pr.json()).proxy;
+          } catch {}
+
+          const opened = await bitOpenUrlForAccount(account, link, proxy);
+          if (opened.success) {
+            bitMsg = `<div class="ok-text">已在本机比特浏览器中打开 (window: ${esc(String(opened.windowId).slice(0, 8))}…)</div>`;
+            // 第一次开窗 / 窗口 id 变了 → 写回数据库
+            if (account.bit_window_id !== opened.windowId) {
+              await fetch(`/api/admin/accounts/${accountId}/bit-window`, {
+                method: 'PUT',
+                headers: authHeaders({ 'Content-Type': 'application/json' }),
+                body: JSON.stringify({ windowId: opened.windowId })
+              }).catch(() => {});
+              loadAccounts();
+            }
+          } else {
+            bitMsg = `<div class="err-text">比特调用失败: ${esc(opened.error)}, 已降级为复制链接</div>`;
+          }
+        }
+
+        result.innerHTML = `
+          <div class="ok-text">支付链接已复制到剪贴板</div>
+          ${bitMsg}
+          <div style="margin-top:.5rem; word-break:break-all;">
+            <a href="${esc(link)}" target="_blank" rel="noopener">${esc(link)}</a>
+          </div>
+        `;
+      } catch (e) {
+        result.innerHTML = '<div class="err-text">请求失败</div>';
+      } finally {
+        if (subscriptionType) {
+          const card = document.getElementById(`plan_${subscriptionType}`);
+          if (card) card.classList.remove('loading');
+        }
+      }
+    }
+
+    // ===== 代理编辑器 =====
+    function editProxy(accountId) {
+      const acct = accountsState.rows.find(r => r.id === accountId);
+      const p = acct?.proxy || { proxyType: 'noproxy', host: '', port: '', proxyUserName: '', hasPassword: false };
+      showModal(`
+        <div class="modal-head">
+          <h3>编辑代理 · #${accountId} ${esc(acct?.email || '')}</h3>
+          <button class="modal-close" onclick="closeModal()">关闭</button>
+        </div>
+        <div class="modal-body">
+          <div class="field">
+            <label>类型</label>
+            <select id="px_type" style="padding:.55rem; border:1px solid #ddd; border-radius:4px;">
+              <option value="noproxy" ${p.proxyType === 'noproxy' ? 'selected' : ''}>不使用代理</option>
+              <option value="http" ${p.proxyType === 'http' ? 'selected' : ''}>HTTP</option>
+              <option value="https" ${p.proxyType === 'https' ? 'selected' : ''}>HTTPS</option>
+              <option value="socks5" ${p.proxyType === 'socks5' ? 'selected' : ''}>SOCKS5</option>
+              <option value="ssh" ${p.proxyType === 'ssh' ? 'selected' : ''}>SSH</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>主机</label>
+            <input type="text" id="px_host" placeholder="proxy.example.com" value="${esc(p.host)}">
+          </div>
+          <div class="field">
+            <label>端口</label>
+            <input type="text" id="px_port" placeholder="8080" value="${esc(p.port)}">
+          </div>
+          <div class="field">
+            <label>用户名</label>
+            <input type="text" id="px_user" value="${esc(p.proxyUserName)}">
+          </div>
+          <div class="field">
+            <label>密码 ${p.hasPassword ? '<span class="hint">(留空表示不修改原密码)</span>' : ''}</label>
+            <input type="password" id="px_pass" placeholder="${p.hasPassword ? '••••••' : ''}">
+          </div>
+          <div id="px_err" class="err-text"></div>
+        </div>
+        <div class="modal-foot">
+          <button class="secondary" onclick="closeModal()">取消</button>
+          <button onclick="saveProxy(${accountId})">保存</button>
+        </div>
+      `);
+    }
+
+    async function saveProxy(accountId) {
+      const errEl = document.getElementById('px_err');
+      const body = {
+        proxyType: document.getElementById('px_type').value,
+        host: document.getElementById('px_host').value.trim(),
+        port: document.getElementById('px_port').value.trim(),
+        proxyUserName: document.getElementById('px_user').value.trim()
+      };
+      const passField = document.getElementById('px_pass').value;
+      // 只在用户输入了内容时才发 proxyPassword 字段, 否则后端保留原值
+      if (passField !== '') body.proxyPassword = passField;
+
+      try {
+        const res = await fetch(`/api/admin/accounts/${accountId}/proxy`, {
+          method: 'PUT',
+          headers: authHeaders({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify(body)
+        });
+        if (handleAuthFailure(res)) return;
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          errEl.textContent = data.error || '保存失败';
+          return;
+        }
+        closeModal();
+        loadAccounts();
+      } catch (e) {
+        errEl.textContent = '请求失败';
+      }
+    }
+
     if (requireLogin()) {
+      loadSettings();
       loadAccounts();
       loadKeys();
       // 每 30 秒静默刷新一次，让倒计时和状态保持新

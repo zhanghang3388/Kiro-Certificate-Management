@@ -2,6 +2,7 @@ const express = require('express');
 const multer = require('multer');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
+const { ProxyAgent, fetch: undiciFetch } = require('undici');
 const db = require('./db');
 
 const app = express();
@@ -244,6 +245,46 @@ function buildSubHeaders(accessToken, accountId, rawMachineId) {
   };
 }
 
+// 把账号绑定的代理 / 环境代理转成 undici ProxyAgent
+function buildProxyAgentForAccount(accountRow) {
+  // 1. 账号粒度代理
+  if (accountRow.proxy_json) {
+    try {
+      const p = JSON.parse(accountRow.proxy_json);
+      if (p.proxyType && p.proxyType !== 'noproxy' && p.host && p.port) {
+        const auth = p.proxyUserName
+          ? `${encodeURIComponent(p.proxyUserName)}:${encodeURIComponent(p.proxyPassword || '')}@`
+          : '';
+        // undici 的 ProxyAgent 只直接支持 http/https；socks5 走 env 也不行, 只能提示
+        const scheme = p.proxyType === 'https' ? 'http' : (p.proxyType === 'socks5' ? null : 'http');
+        if (!scheme) {
+          console.warn(`[sub] account=${accountRow.id} 代理类型 ${p.proxyType} 暂不支持给后端 AWS 调用使用, 跳过`);
+        } else {
+          const uri = `${scheme}://${auth}${p.host}:${p.port}`;
+          return { agent: new ProxyAgent({ uri, requestTls: { rejectUnauthorized: false } }), source: `account#${accountRow.id}` };
+        }
+      }
+    } catch (e) {
+      console.warn(`[sub] account=${accountRow.id} 代理 JSON 解析失败:`, e.message);
+    }
+  }
+  // 2. 环境变量代理（HTTPS_PROXY 等）
+  const envProxy = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy;
+  if (envProxy) {
+    return { agent: new ProxyAgent({ uri: envProxy, requestTls: { rejectUnauthorized: false } }), source: 'env' };
+  }
+  return { agent: null, source: 'direct' };
+}
+
+async function fetchAwsForAccount(accountRow, url, init) {
+  const { agent, source } = buildProxyAgentForAccount(accountRow);
+  console.log(`[sub] fetch ${url} via ${source}`);
+  if (agent) {
+    return undiciFetch(url, { ...init, dispatcher: agent });
+  }
+  return fetch(url, init);
+}
+
 // 确保账号有可用的 access token，必要时先刷新
 async function ensureFreshAccessToken(accountRow) {
   const raw = JSON.parse(accountRow.raw_json);
@@ -266,7 +307,7 @@ async function listAvailableSubscriptions(accountRow) {
   const body = JSON.stringify({ profileArn: resolveProfileArn(fresh.raw) });
   console.log(`[sub] listAvailableSubscriptions account=${accountRow.id} email=${accountRow.email} profileArn=${resolveProfileArn(fresh.raw)}`);
   try {
-    const response = await fetch(url, { method: 'POST', headers, body });
+    const response = await fetchAwsForAccount(accountRow, url, { method: 'POST', headers, body });
     const text = await response.text();
     if (!response.ok) {
       console.error(`[sub] list failed account=${accountRow.id} status=${response.status} body=${text.slice(0, 500)}`);
@@ -296,7 +337,7 @@ async function createSubscriptionToken(accountRow, subscriptionType) {
   console.log(`[sub] CreateSubscriptionToken account=${accountRow.id} email=${accountRow.email} subscriptionType=${subscriptionType || '(none)'} profileArn=${payload.profileArn} region=${fresh.raw.region || 'us-east-1'} authMethod=${fresh.raw.authMethod || ''} provider=${fresh.raw.provider || ''}`);
 
   try {
-    const response = await fetch(url, {
+    const response = await fetchAwsForAccount(accountRow, url, {
       method: 'POST',
       headers,
       body: JSON.stringify(payload)

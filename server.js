@@ -410,7 +410,11 @@ async function listAvailableSubscriptions(accountRow) {
       return { success: false, error: `HTTP ${response.status}: ${text.slice(0, 200)}` };
     }
     const data = JSON.parse(text);
-    return { success: true, plans: data.subscriptionPlans || [], disclaimer: data.disclaimer || [], baseUrl };
+    const plans = data.subscriptionPlans || [];
+    // 把每个档位的 name + qSubscriptionType 打出来, 用于核对前端传的 subscriptionType 是否在白名单里
+    // KIRO 账号典型应返回 KIRO_PRO 而非 Q_DEVELOPER_STANDALONE_PRO
+    console.log(`[sub] list ok account=${accountRow.id} plans=${JSON.stringify(plans.map(p => ({ name: p.name, type: p.qSubscriptionType })))}`);
+    return { success: true, plans, disclaimer: data.disclaimer || [], baseUrl };
   } catch (err) {
     console.error(`[sub] list error account=${accountRow.id}`, err);
     return { success: false, error: err.message || 'Unknown error' };

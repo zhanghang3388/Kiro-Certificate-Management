@@ -256,6 +256,9 @@ const Q_REGION_BASES = [
 ];
 const KIRO_USAGE_UA = 'aws-sdk-js/1.0.18 ua/2.1 os/windows lang/js md/nodejs#20.16.0 api/codewhispererstreaming#1.0.18 m/E KiroIDE-0.6.18';
 
+// 探测时同时回传 usage 响应体, 方便上层判定订阅状态 / 用户信息
+// 因为 403 "User is not authorized" 经常是账号本身的状态问题 (已订阅 / suspended / 区域不匹配),
+// 把 getUsageLimits 拿到的 subscriptionInfo / userInfo 打出来能一眼看出是不是这种情况
 async function probeAccountRegion(accountRow, accessToken) {
   for (const base of Q_REGION_BASES) {
     const url = `${base}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true`;
@@ -268,16 +271,26 @@ async function probeAccountRegion(accountRow, accessToken) {
           'User-Agent': KIRO_USAGE_UA
         }
       });
+      const text = await resp.text();
       if (resp.status === 200) {
-        console.log(`[sub] probed region for account=${accountRow.id}: ${base}`);
-        return base;
+        let usage = {};
+        try { usage = JSON.parse(text); } catch {}
+        const subInfo = usage.subscriptionInfo || {};
+        const userInfo = usage.userInfo || {};
+        console.log(`[sub] probed region for account=${accountRow.id}: ${base} subscription=${subInfo.subscriptionTitle || 'Free'} email=${userInfo.email || 'N/A'}`);
+        return { base, usage };
       }
-      console.log(`[sub] probe ${base} → ${resp.status} for account=${accountRow.id}`);
+      // 403 + suspended 是账号被封, 上层应直接放弃, 不必再走 list/create
+      if (resp.status === 403 && text.toLowerCase().includes('suspended')) {
+        console.error(`[sub] account=${accountRow.id} SUSPENDED at ${base}: ${text.slice(0, 200)}`);
+        return { base: null, suspended: true, error: text.slice(0, 200) };
+      }
+      console.log(`[sub] probe ${base} → ${resp.status} for account=${accountRow.id} body=${text.slice(0, 200)}`);
     } catch (err) {
       console.warn(`[sub] probe ${base} error:`, err.message);
     }
   }
-  return null;
+  return { base: null };
 }
 
 // 把账号绑定的代理转成代理 URL（tlsclientwrapper 接受 http/https/socks5 URL 字符串）
@@ -377,13 +390,18 @@ async function listAvailableSubscriptions(accountRow) {
   if (!fresh.ok) return { success: false, error: fresh.error };
 
   // 通过 getUsageLimits 探测真实区域, 探测失败回退到 raw.region
-  let baseUrl = await probeAccountRegion(accountRow, fresh.accessToken);
-  if (!baseUrl) baseUrl = getQEndpoint(fresh.raw.region);
+  const probe = await probeAccountRegion(accountRow, fresh.accessToken);
+  if (probe.suspended) {
+    return { success: false, error: `账号被 AWS 封停 (suspended): ${probe.error}` };
+  }
+  const baseUrl = probe.base || getQEndpoint(fresh.raw.region);
+  // 把当前订阅状态打出来 —— 如果用户已经是 PRO/PRO_PLUS, 后续 CreateSubscriptionToken 经常 403
+  const subTitle = probe.usage?.subscriptionInfo?.subscriptionTitle || 'unknown';
 
   const url = `${baseUrl}/listAvailableSubscriptions`;
   const headers = buildSubHeaders(fresh.accessToken, accountRow.id, fresh.raw.machineId, fresh.raw.clientId);
   const body = JSON.stringify({ profileArn: resolveProfileArn(fresh.raw) });
-  console.log(`[sub] listAvailableSubscriptions account=${accountRow.id} email=${accountRow.email} base=${baseUrl} profileArn=${resolveProfileArn(fresh.raw)}`);
+  console.log(`[sub] listAvailableSubscriptions account=${accountRow.id} email=${accountRow.email} base=${baseUrl} profileArn=${resolveProfileArn(fresh.raw)} currentSubscription=${subTitle}`);
   try {
     const response = await fetchAwsForAccount(accountRow, url, { method: 'POST', headers, body });
     const text = await response.text();
@@ -403,17 +421,29 @@ async function createSubscriptionToken(accountRow, subscriptionType) {
   const fresh = await forceRefreshAccessToken(accountRow);
   if (!fresh.ok) return { success: false, error: fresh.error };
 
-  // 同样先探测区域
-  let baseUrl = await probeAccountRegion(accountRow, fresh.accessToken);
-  if (!baseUrl) baseUrl = getQEndpoint(fresh.raw.region);
+  // 同样先探测区域 + 当前订阅状态
+  const probe = await probeAccountRegion(accountRow, fresh.accessToken);
+  if (probe.suspended) {
+    return { success: false, error: `账号被 AWS 封停 (suspended): ${probe.error}` };
+  }
+  const baseUrl = probe.base || getQEndpoint(fresh.raw.region);
+  const subTitle = probe.usage?.subscriptionInfo?.subscriptionTitle || 'unknown';
+  // 关键诊断: 如果 currentSubscription 已经不是 Free, AWS 大概率会拒掉 CreateSubscriptionToken
+  // 因为这个接口本质是"为还没付费的账号生成跳转 Stripe 的链接"
+  console.log(`[sub] CreateSubscriptionToken precheck account=${accountRow.id} currentSubscription=${subTitle}`);
 
   const url = `${baseUrl}/CreateSubscriptionToken`;
   const profileArn = resolveProfileArn(fresh.raw);
   const headers = buildSubHeaders(fresh.accessToken, accountRow.id, fresh.raw.machineId, fresh.raw.clientId);
-
-  console.log(`[sub] CreateSubscriptionToken account=${accountRow.id} email=${accountRow.email} base=${baseUrl} subscriptionType=${subscriptionType || '(none)'} profileArn=${profileArn} authMethod=${fresh.raw.authMethod || ''} provider=${fresh.raw.provider || ''}`);
+  // 出口诊断: 通过 ipify 看看这次实际从哪个 IP 出去 (账号代理 vs VPS 直出 vs env 代理)
+  // 帮助判断 403 是不是 IP 风控导致
+  const proxyInfo = getProxyUrlForAccount(accountRow);
+  console.log(`[sub] CreateSubscriptionToken account=${accountRow.id} email=${accountRow.email} base=${baseUrl} subscriptionType=${subscriptionType || '(none)'} profileArn=${profileArn} authMethod=${fresh.raw.authMethod || ''} provider=${fresh.raw.provider || ''} egress=${proxyInfo.source}${proxyInfo.url ? ` (${proxyInfo.url.replace(/\/\/[^@]*@/, '//***@')})` : ''}`);
 
   // 参考 register-cli: 新账号 Stripe 关联未就绪时会返回 200 空 url 或 4xx, 重试 6 次每次间隔 4 秒
+  // 注: 如果 403 是 "User is not authorized to access this feature", 重试不会自愈,
+  //     原因通常是: 1) 账号已订阅 (currentSubscription != Free) 2) 账号被 suspended 3) profileArn 与 authMethod 不匹配
+  //     真正需要重试的是: 200 + 空 encodedVerificationUrl (Stripe 关联未就绪)
   const ATTEMPTS = 6;
   const INTERVAL_MS = 4000;
   let lastError = '未知错误';
@@ -455,6 +485,11 @@ async function createSubscriptionToken(accountRow, subscriptionType) {
       } else {
         lastError = `HTTP ${response.status}: ${text.slice(0, 400)}`;
         console.error(`[sub] account=${accountRow.id} attempt=${attempt}/${ATTEMPTS} ${lastError}`);
+        // 403 "User is not authorized" 是账号侧硬错, 重试不会自愈, 直接退出省时间
+        if (response.status === 403 && /not authorized/i.test(text)) {
+          console.error(`[sub] account=${accountRow.id} 403 非临时错误, 跳过剩余重试. 排查方向: 1) 当前订阅状态 (Free?) 2) profileArn 是否与 authMethod 匹配 3) 账号是否 suspended`);
+          return { success: false, error: `HTTP 403 (非临时): ${text.slice(0, 200)}` };
+        }
       }
     } catch (err) {
       lastError = err.message || 'Unknown error';

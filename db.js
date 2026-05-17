@@ -35,4 +35,19 @@ db.exec(`
   );
 `);
 
+// 兼容旧库：增量添加保活相关字段
+const existingCols = new Set(
+  db.prepare(`PRAGMA table_info(accounts)`).all().map(c => c.name)
+);
+const addColumn = (name, ddl) => {
+  if (!existingCols.has(name)) {
+    db.exec(`ALTER TABLE accounts ADD COLUMN ${ddl}`);
+  }
+};
+addColumn('access_token', 'access_token TEXT');
+addColumn('expires_at', 'expires_at INTEGER');
+addColumn('last_checked_at', 'last_checked_at TEXT');
+addColumn('last_status', `last_status TEXT DEFAULT 'unknown'`);
+addColumn('last_error', 'last_error TEXT');
+
 module.exports = db;

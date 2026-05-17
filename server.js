@@ -416,11 +416,20 @@ async function createSubscriptionToken(accountRow, subscriptionType) {
     };
     if (subscriptionType) payload.subscriptionType = subscriptionType;
 
+    const reqHeaders = { ...headers, 'amz-sdk-invocation-id': uuidv4() };
+    const reqBody = JSON.stringify(payload);
+    if (attempt === 1) {
+      // 首次尝试时 dump 完整请求, 便于定位与 register-cli 的差异
+      console.log(`[sub] DUMP url=${url}`);
+      console.log(`[sub] DUMP headers=${JSON.stringify(reqHeaders)}`);
+      console.log(`[sub] DUMP body=${reqBody}`);
+    }
+
     try {
       const response = await fetchAwsForAccount(accountRow, url, {
         method: 'POST',
-        headers: { ...headers, 'amz-sdk-invocation-id': uuidv4() },
-        body: JSON.stringify(payload)
+        headers: reqHeaders,
+        body: reqBody
       });
       const text = await response.text();
 

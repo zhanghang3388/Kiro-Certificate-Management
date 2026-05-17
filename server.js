@@ -17,10 +17,23 @@ const KIRO_USER_AGENT = `aws-sdk-js/1.0.18 ua/2.1 os/windows lang/js md/nodejs#2
 
 // Kiro 订阅 API 配置
 const KIRO_SUBSCRIPTION_VERSION = '0.12.155';
-const KIRO_SUB_USER_AGENT = `aws-sdk-js/1.0.0 ua/2.1 os/win32#10.0.19043 lang/js md/nodejs#22.22.0 api/codewhispererruntime#1.0.0 m/N,E KiroIDE-${KIRO_SUBSCRIPTION_VERSION}`;
-const KIRO_SUB_AMZ_USER_AGENT = `aws-sdk-js/1.0.0 KiroIDE-${KIRO_SUBSCRIPTION_VERSION}`;
 const KIRO_BUILDER_ID_PROFILE_ARN = 'arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX';
 const KIRO_SOCIAL_PROFILE_ARN = 'arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK';
+
+// 给账号生成稳定的 machineId（与参考项目保持一致，加进 User-Agent 后缀）
+const crypto = require('crypto');
+function getStableMachineId(accountId) {
+  return crypto.createHash('sha256').update(`kiro-device-${accountId}`).digest('hex');
+}
+
+function getSubscriptionUserAgent(machineId) {
+  const suffix = machineId ? `KiroIDE-${KIRO_SUBSCRIPTION_VERSION}-${machineId}` : `KiroIDE-${KIRO_SUBSCRIPTION_VERSION}`;
+  return `aws-sdk-js/1.0.0 ua/2.1 os/win32#10.0.19043 lang/js md/nodejs#22.22.0 api/codewhispererruntime#1.0.0 m/N,E ${suffix}`;
+}
+function getSubscriptionAmzUserAgent(machineId) {
+  const suffix = machineId ? `KiroIDE-${KIRO_SUBSCRIPTION_VERSION}-${machineId}` : `KiroIDE-${KIRO_SUBSCRIPTION_VERSION}`;
+  return `aws-sdk-js/1.0.0 ${suffix}`;
+}
 
 function getQEndpoint(region) {
   if (region && region.startsWith('eu-')) return 'https://q.eu-central-1.amazonaws.com';
@@ -219,12 +232,13 @@ async function keepAliveTick() {
 
 // ========== Kiro 订阅 API ==========
 
-function buildSubHeaders(accessToken) {
+function buildSubHeaders(accessToken, accountId, rawMachineId) {
+  const machineId = rawMachineId || getStableMachineId(accountId);
   return {
     'Authorization': `Bearer ${accessToken}`,
     'content-type': 'application/json',
-    'user-agent': KIRO_SUB_USER_AGENT,
-    'x-amz-user-agent': KIRO_SUB_AMZ_USER_AGENT,
+    'user-agent': getSubscriptionUserAgent(machineId),
+    'x-amz-user-agent': getSubscriptionAmzUserAgent(machineId),
     'amz-sdk-invocation-id': uuidv4(),
     'amz-sdk-request': 'attempt=1; max=1'
   };
@@ -248,19 +262,20 @@ async function listAvailableSubscriptions(accountRow) {
   if (!fresh.ok) return { success: false, error: fresh.error };
 
   const url = `${getQEndpoint(fresh.raw.region)}/listAvailableSubscriptions`;
+  const headers = buildSubHeaders(fresh.accessToken, accountRow.id, fresh.raw.machineId);
+  const body = JSON.stringify({ profileArn: resolveProfileArn(fresh.raw) });
+  console.log(`[sub] listAvailableSubscriptions account=${accountRow.id} email=${accountRow.email} profileArn=${resolveProfileArn(fresh.raw)}`);
   try {
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: buildSubHeaders(fresh.accessToken),
-      body: JSON.stringify({ profileArn: resolveProfileArn(fresh.raw) })
-    });
+    const response = await fetch(url, { method: 'POST', headers, body });
     const text = await response.text();
     if (!response.ok) {
+      console.error(`[sub] list failed account=${accountRow.id} status=${response.status} body=${text.slice(0, 500)}`);
       return { success: false, error: `HTTP ${response.status}: ${text.slice(0, 200)}` };
     }
     const data = JSON.parse(text);
     return { success: true, plans: data.subscriptionPlans || [], disclaimer: data.disclaimer || [] };
   } catch (err) {
+    console.error(`[sub] list error account=${accountRow.id}`, err);
     return { success: false, error: err.message || 'Unknown error' };
   }
 }
@@ -276,20 +291,26 @@ async function createSubscriptionToken(accountRow, subscriptionType) {
     provider: 'STRIPE'
   };
   if (subscriptionType) payload.subscriptionType = subscriptionType;
+  const headers = buildSubHeaders(fresh.accessToken, accountRow.id, fresh.raw.machineId);
+
+  console.log(`[sub] CreateSubscriptionToken account=${accountRow.id} email=${accountRow.email} subscriptionType=${subscriptionType || '(none)'} profileArn=${payload.profileArn} region=${fresh.raw.region || 'us-east-1'} authMethod=${fresh.raw.authMethod || ''} provider=${fresh.raw.provider || ''}`);
 
   try {
     const response = await fetch(url, {
       method: 'POST',
-      headers: buildSubHeaders(fresh.accessToken),
+      headers,
       body: JSON.stringify(payload)
     });
     const text = await response.text();
     if (!response.ok) {
-      return { success: false, error: `HTTP ${response.status}: ${text.slice(0, 300)}` };
+      console.error(`[sub] create failed account=${accountRow.id} status=${response.status} body=${text}`);
+      return { success: false, error: `HTTP ${response.status}: ${text.slice(0, 400)}` };
     }
     const data = JSON.parse(text);
+    console.log(`[sub] create ok account=${accountRow.id} status=${data.status}`);
     return { success: true, url: data.encodedVerificationUrl, status: data.status, raw: data };
   } catch (err) {
+    console.error(`[sub] create error account=${accountRow.id}`, err);
     return { success: false, error: err.message || 'Unknown error' };
   }
 }

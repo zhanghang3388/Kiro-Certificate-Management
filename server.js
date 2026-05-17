@@ -21,9 +21,12 @@ const KIRO_SUBSCRIPTION_VERSION = '0.12.155';
 const KIRO_BUILDER_ID_PROFILE_ARN = 'arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX';
 const KIRO_SOCIAL_PROFILE_ARN = 'arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK';
 
-// 给账号生成稳定的 machineId（与参考项目保持一致，加进 User-Agent 后缀）
-const crypto = require('crypto');
-function getStableMachineId(accountId) {
+// 给账号生成稳定的 machineId（与 register-cli 一致：cli-<clientId 前 12 字符>）
+function getStableMachineId(accountId, clientId) {
+  if (clientId && typeof clientId === 'string' && clientId.length >= 12) {
+    return `cli-${clientId.slice(0, 12)}`;
+  }
+  const crypto = require('crypto');
   return crypto.createHash('sha256').update(`kiro-device-${accountId}`).digest('hex');
 }
 
@@ -233,8 +236,8 @@ async function keepAliveTick() {
 
 // ========== Kiro 订阅 API ==========
 
-function buildSubHeaders(accessToken, accountId, rawMachineId) {
-  const machineId = rawMachineId || getStableMachineId(accountId);
+function buildSubHeaders(accessToken, accountId, rawMachineId, clientId) {
+  const machineId = rawMachineId || getStableMachineId(accountId, clientId);
   return {
     'Authorization': `Bearer ${accessToken}`,
     'content-type': 'application/json',
@@ -243,6 +246,37 @@ function buildSubHeaders(accessToken, accountId, rawMachineId) {
     'amz-sdk-invocation-id': uuidv4(),
     'amz-sdk-request': 'attempt=1; max=1'
   };
+}
+
+// 通过 getUsageLimits 自动探测账号实际所在区域（参考 register-cli）
+const Q_REGION_BASES = [
+  'https://q.us-east-1.amazonaws.com',
+  'https://q.eu-central-1.amazonaws.com'
+];
+const KIRO_USAGE_UA = 'aws-sdk-js/1.0.18 ua/2.1 os/windows lang/js md/nodejs#20.16.0 api/codewhispererstreaming#1.0.18 m/E KiroIDE-0.6.18';
+
+async function probeAccountRegion(accountRow, accessToken) {
+  for (const base of Q_REGION_BASES) {
+    const url = `${base}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true`;
+    try {
+      const resp = await fetchAwsForAccount(accountRow, url, {
+        method: 'GET',
+        headers: {
+          'Accept': 'application/json',
+          'Authorization': `Bearer ${accessToken}`,
+          'User-Agent': KIRO_USAGE_UA
+        }
+      });
+      if (resp.status === 200) {
+        console.log(`[sub] probed region for account=${accountRow.id}: ${base}`);
+        return base;
+      }
+      console.log(`[sub] probe ${base} → ${resp.status} for account=${accountRow.id}`);
+    } catch (err) {
+      console.warn(`[sub] probe ${base} error:`, err.message);
+    }
+  }
+  return null;
 }
 
 // 把账号绑定的代理 / 环境代理转成 undici ProxyAgent
@@ -302,10 +336,14 @@ async function listAvailableSubscriptions(accountRow) {
   const fresh = await ensureFreshAccessToken(accountRow);
   if (!fresh.ok) return { success: false, error: fresh.error };
 
-  const url = `${getQEndpoint(fresh.raw.region)}/listAvailableSubscriptions`;
-  const headers = buildSubHeaders(fresh.accessToken, accountRow.id, fresh.raw.machineId);
+  // 通过 getUsageLimits 探测真实区域, 探测失败回退到 raw.region
+  let baseUrl = await probeAccountRegion(accountRow, fresh.accessToken);
+  if (!baseUrl) baseUrl = getQEndpoint(fresh.raw.region);
+
+  const url = `${baseUrl}/listAvailableSubscriptions`;
+  const headers = buildSubHeaders(fresh.accessToken, accountRow.id, fresh.raw.machineId, fresh.raw.clientId);
   const body = JSON.stringify({ profileArn: resolveProfileArn(fresh.raw) });
-  console.log(`[sub] listAvailableSubscriptions account=${accountRow.id} email=${accountRow.email} profileArn=${resolveProfileArn(fresh.raw)}`);
+  console.log(`[sub] listAvailableSubscriptions account=${accountRow.id} email=${accountRow.email} base=${baseUrl} profileArn=${resolveProfileArn(fresh.raw)}`);
   try {
     const response = await fetchAwsForAccount(accountRow, url, { method: 'POST', headers, body });
     const text = await response.text();
@@ -314,7 +352,7 @@ async function listAvailableSubscriptions(accountRow) {
       return { success: false, error: `HTTP ${response.status}: ${text.slice(0, 200)}` };
     }
     const data = JSON.parse(text);
-    return { success: true, plans: data.subscriptionPlans || [], disclaimer: data.disclaimer || [] };
+    return { success: true, plans: data.subscriptionPlans || [], disclaimer: data.disclaimer || [], baseUrl };
   } catch (err) {
     console.error(`[sub] list error account=${accountRow.id}`, err);
     return { success: false, error: err.message || 'Unknown error' };
@@ -325,35 +363,61 @@ async function createSubscriptionToken(accountRow, subscriptionType) {
   const fresh = await ensureFreshAccessToken(accountRow);
   if (!fresh.ok) return { success: false, error: fresh.error };
 
-  const url = `${getQEndpoint(fresh.raw.region)}/CreateSubscriptionToken`;
-  const payload = {
-    clientToken: uuidv4(),
-    profileArn: resolveProfileArn(fresh.raw),
-    provider: 'STRIPE'
-  };
-  if (subscriptionType) payload.subscriptionType = subscriptionType;
-  const headers = buildSubHeaders(fresh.accessToken, accountRow.id, fresh.raw.machineId);
+  // 同样先探测区域
+  let baseUrl = await probeAccountRegion(accountRow, fresh.accessToken);
+  if (!baseUrl) baseUrl = getQEndpoint(fresh.raw.region);
 
-  console.log(`[sub] CreateSubscriptionToken account=${accountRow.id} email=${accountRow.email} subscriptionType=${subscriptionType || '(none)'} profileArn=${payload.profileArn} region=${fresh.raw.region || 'us-east-1'} authMethod=${fresh.raw.authMethod || ''} provider=${fresh.raw.provider || ''}`);
+  const url = `${baseUrl}/CreateSubscriptionToken`;
+  const profileArn = resolveProfileArn(fresh.raw);
+  const headers = buildSubHeaders(fresh.accessToken, accountRow.id, fresh.raw.machineId, fresh.raw.clientId);
 
-  try {
-    const response = await fetchAwsForAccount(accountRow, url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(payload)
-    });
-    const text = await response.text();
-    if (!response.ok) {
-      console.error(`[sub] create failed account=${accountRow.id} status=${response.status} body=${text}`);
-      return { success: false, error: `HTTP ${response.status}: ${text.slice(0, 400)}` };
+  console.log(`[sub] CreateSubscriptionToken account=${accountRow.id} email=${accountRow.email} base=${baseUrl} subscriptionType=${subscriptionType || '(none)'} profileArn=${profileArn} authMethod=${fresh.raw.authMethod || ''} provider=${fresh.raw.provider || ''}`);
+
+  // 参考 register-cli: 新账号 Stripe 关联未就绪时会返回 200 空 url 或 4xx, 重试 6 次每次间隔 4 秒
+  const ATTEMPTS = 6;
+  const INTERVAL_MS = 4000;
+  let lastError = '未知错误';
+
+  for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
+    const payload = {
+      clientToken: uuidv4(),
+      profileArn,
+      provider: 'STRIPE'
+    };
+    if (subscriptionType) payload.subscriptionType = subscriptionType;
+
+    try {
+      const response = await fetchAwsForAccount(accountRow, url, {
+        method: 'POST',
+        headers: { ...headers, 'amz-sdk-invocation-id': uuidv4() },
+        body: JSON.stringify(payload)
+      });
+      const text = await response.text();
+
+      if (response.ok) {
+        let data = {};
+        try { data = JSON.parse(text); } catch {}
+        if (data.encodedVerificationUrl) {
+          console.log(`[sub] create ok account=${accountRow.id} attempt=${attempt}/${ATTEMPTS} status=${data.status}`);
+          return { success: true, url: data.encodedVerificationUrl, status: data.status, raw: data };
+        }
+        lastError = `200 但缺 encodedVerificationUrl: ${text.slice(0, 200)}`;
+        console.warn(`[sub] account=${accountRow.id} attempt=${attempt}/${ATTEMPTS} ${lastError}`);
+      } else {
+        lastError = `HTTP ${response.status}: ${text.slice(0, 400)}`;
+        console.error(`[sub] account=${accountRow.id} attempt=${attempt}/${ATTEMPTS} ${lastError}`);
+      }
+    } catch (err) {
+      lastError = err.message || 'Unknown error';
+      console.error(`[sub] account=${accountRow.id} attempt=${attempt}/${ATTEMPTS} fetch error:`, err);
     }
-    const data = JSON.parse(text);
-    console.log(`[sub] create ok account=${accountRow.id} status=${data.status}`);
-    return { success: true, url: data.encodedVerificationUrl, status: data.status, raw: data };
-  } catch (err) {
-    console.error(`[sub] create error account=${accountRow.id}`, err);
-    return { success: false, error: err.message || 'Unknown error' };
+
+    if (attempt < ATTEMPTS) {
+      await new Promise(r => setTimeout(r, INTERVAL_MS));
+    }
   }
+
+  return { success: false, error: `重试 ${ATTEMPTS} 次仍失败: ${lastError}` };
 }
 
 // ========== Settings (BitBrowser 配置) ==========

@@ -362,8 +362,18 @@ async function ensureFreshAccessToken(accountRow) {
   return { ok: true, accessToken: result.accessToken, raw };
 }
 
+// 强制刷新一次 access token（订阅 API 要求 token 必须是刚换出来的, 跟 register-cli 的 verifyAlive 行为一致）
+async function forceRefreshAccessToken(accountRow) {
+  const raw = JSON.parse(accountRow.raw_json);
+  const result = await refreshTokenForAccount(accountRow);
+  persistRefresh(accountRow.id, raw, result);
+  if (!result.success) return { ok: false, error: result.error };
+  // persistRefresh 会更新 raw.accessToken/refreshToken/expiresAt
+  return { ok: true, accessToken: result.accessToken, raw: { ...raw, accessToken: result.accessToken, refreshToken: result.refreshToken, expiresAt: result.expiresIn ? Date.now() + result.expiresIn * 1000 : raw.expiresAt } };
+}
+
 async function listAvailableSubscriptions(accountRow) {
-  const fresh = await ensureFreshAccessToken(accountRow);
+  const fresh = await forceRefreshAccessToken(accountRow);
   if (!fresh.ok) return { success: false, error: fresh.error };
 
   // 通过 getUsageLimits 探测真实区域, 探测失败回退到 raw.region
@@ -390,7 +400,7 @@ async function listAvailableSubscriptions(accountRow) {
 }
 
 async function createSubscriptionToken(accountRow, subscriptionType) {
-  const fresh = await ensureFreshAccessToken(accountRow);
+  const fresh = await forceRefreshAccessToken(accountRow);
   if (!fresh.ok) return { success: false, error: fresh.error };
 
   // 同样先探测区域

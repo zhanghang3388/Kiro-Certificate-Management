@@ -3,6 +3,7 @@ const multer = require('multer');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const { ProxyAgent, fetch: undiciFetch } = require('undici');
+const { ModuleClient, SessionClient } = require('tlsclientwrapper');
 const db = require('./db');
 
 const app = express();
@@ -279,9 +280,8 @@ async function probeAccountRegion(accountRow, accessToken) {
   return null;
 }
 
-// 把账号绑定的代理 / 环境代理转成 undici ProxyAgent
-function buildProxyAgentForAccount(accountRow) {
-  // 1. 账号粒度代理
+// 把账号绑定的代理转成代理 URL（tlsclientwrapper 接受 http/https/socks5 URL 字符串）
+function getProxyUrlForAccount(accountRow) {
   if (accountRow.proxy_json) {
     try {
       const p = JSON.parse(accountRow.proxy_json);
@@ -289,34 +289,64 @@ function buildProxyAgentForAccount(accountRow) {
         const auth = p.proxyUserName
           ? `${encodeURIComponent(p.proxyUserName)}:${encodeURIComponent(p.proxyPassword || '')}@`
           : '';
-        // undici 的 ProxyAgent 只直接支持 http/https；socks5 走 env 也不行, 只能提示
-        const scheme = p.proxyType === 'https' ? 'http' : (p.proxyType === 'socks5' ? null : 'http');
-        if (!scheme) {
-          console.warn(`[sub] account=${accountRow.id} 代理类型 ${p.proxyType} 暂不支持给后端 AWS 调用使用, 跳过`);
-        } else {
-          const uri = `${scheme}://${auth}${p.host}:${p.port}`;
-          return { agent: new ProxyAgent({ uri, requestTls: { rejectUnauthorized: false } }), source: `account#${accountRow.id}` };
-        }
+        const scheme = p.proxyType === 'socks5' ? 'socks5' : 'http';
+        return { url: `${scheme}://${auth}${p.host}:${p.port}`, source: `account#${accountRow.id}` };
       }
     } catch (e) {
       console.warn(`[sub] account=${accountRow.id} 代理 JSON 解析失败:`, e.message);
     }
   }
-  // 2. 环境变量代理（HTTPS_PROXY 等）
   const envProxy = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy;
-  if (envProxy) {
-    return { agent: new ProxyAgent({ uri: envProxy, requestTls: { rejectUnauthorized: false } }), source: 'env' };
-  }
-  return { agent: null, source: 'direct' };
+  if (envProxy) return { url: envProxy, source: 'env' };
+  return { url: undefined, source: 'direct' };
 }
 
+// 全局 TLS 客户端模块（一次初始化即可, 内部线程池）
+let tlsModule = null;
+async function getTlsModule() {
+  if (tlsModule) return tlsModule;
+  tlsModule = new ModuleClient();
+  await tlsModule.open();
+  console.log('[tls] ModuleClient ready, pool=' + JSON.stringify(tlsModule.getPoolStats()));
+  return tlsModule;
+}
+
+// 用 chrome_144 TLS 指纹发起 fetch（与 register-cli 保持一致）
 async function fetchAwsForAccount(accountRow, url, init) {
-  const { agent, source } = buildProxyAgentForAccount(accountRow);
-  console.log(`[sub] fetch ${url} via ${source}`);
-  if (agent) {
-    return undiciFetch(url, { ...init, dispatcher: agent });
+  const { url: proxyUrl, source } = getProxyUrlForAccount(accountRow);
+  console.log(`[sub] fetch ${url} via ${source}${proxyUrl ? ` (${proxyUrl.replace(/\/\/[^@]*@/, '//***@')})` : ''}`);
+
+  const mod = await getTlsModule();
+  const session = new SessionClient(mod, {
+    tlsClientIdentifier: 'chrome_144',
+    timeoutSeconds: 60,
+    followRedirects: true,
+    insecureSkipVerify: true,
+    proxyUrl
+  });
+
+  try {
+    const method = (init?.method || 'GET').toUpperCase();
+    const headers = init?.headers || {};
+    let resp;
+    if (method === 'GET') {
+      resp = await session.get(url, { headers });
+    } else if (method === 'POST') {
+      resp = await session.post(url, init?.body || '', { headers });
+    } else {
+      throw new Error(`不支持的方法: ${method}`);
+    }
+    // 包装成 fetch Response 风格的接口
+    return {
+      ok: resp.status >= 200 && resp.status < 300,
+      status: resp.status,
+      headers: resp.headers || {},
+      text: async () => resp.body || '',
+      json: async () => { try { return JSON.parse(resp.body || ''); } catch { return {}; } }
+    };
+  } finally {
+    try { await session.destroySession(); } catch { /* ignore */ }
   }
-  return fetch(url, init);
 }
 
 // 确保账号有可用的 access token，必要时先刷新
